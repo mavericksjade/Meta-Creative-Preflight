@@ -290,7 +290,7 @@ textarea.tall{min-height:160px}
       <div class="toolbar" style="margin:0"><button class="btn primary" type="button" id="pwSave">Connect</button><button class="btn" type="button" id="keysClear">Remove keys from this browser</button></div>
       <div id="connOut" style="margin-top:12px"></div>
     </div>
-    <p class="meta">Tool version 2.0 (29 Oct 2026). If you don’t see this version after uploading a new file, press Ctrl+F5.</p>
+    <p class="meta">Tool version 2.1 (29 Oct 2026). If you don’t see version 2.1 after uploading a new file, press Ctrl+F5.</p>
     <div class="form">
       <h3>Backup</h3>
       <p class="meta" style="margin-top:4px">Everything is stored in this browser only. Download a backup before clearing your browser or moving to another computer.</p>
@@ -463,11 +463,15 @@ function saveCfg(c) { localStorage.setItem(LS_AI, JSON.stringify(c)); }
 function blobToB64(b) { return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1]); r.onerror = rej; r.readAsDataURL(b); }); }
 const SYSTEM = 'You are a strict reviewer of Meta (Facebook/Instagram) ad creatives. Reply with one valid JSON object only: no prose, no markdown fences.';
 
-async function req(url, opts, label) {
-  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 120000);
+async function req(url, opts, label, timeoutS = 180) {
+  const ctl = new AbortController(); let timedOut = false;
+  const t = setTimeout(() => { timedOut = true; ctl.abort(); }, timeoutS * 1000);
   let r;
   try { r = await fetch(url, Object.assign({ signal: ctl.signal }, opts)); }
-  catch (e) { throw { code: 'network', message: `Can’t reach ${label}. Check your internet connection, and turn off any ad or privacy blocker for this site.`, detail: String(e && e.message || e) }; }
+  catch (e) {
+    if (timedOut) throw { code: 'timeout', message: `${label} didn’t answer within ${timeoutS} seconds.` };
+    throw { code: 'network', message: `Can’t reach ${label}. Check your internet connection, and turn off any ad or privacy blocker for this site.`, detail: String(e && e.message || e) };
+  }
   finally { clearTimeout(t); }
   const text = await r.text(); let d = null; try { d = JSON.parse(text); } catch (e) { /* not JSON */ }
   if (!r.ok) {
@@ -508,21 +512,35 @@ async function listModels(provider, key) {
     .map(m => m.id)
     .sort((a, b) => pref(b) - pref(a) || rankModel(b) - rankModel(a) || a.localeCompare(b));
 }
-async function callModel(prompt, images, override) {
+const noThinkCfg = new Set();
+function thinkingFor(model) {
+  if (noThinkCfg.has(model)) return null;
+  if (/^gemini-[3-9]/i.test(model)) return { thinkingLevel: 'low' };
+  if (/^gemini-2\.5-flash/i.test(model)) return { thinkingBudget: 0 };
+  return null;
+}
+async function callModel(prompt, images, override, timeoutS) {
   const c = aiCfg(), id = override?.provider || c.provider;
   const key = (override?.key ?? c.keys[id] ?? '').trim();
   const model = override?.model || c.models[id];
   if (!key) throw { code: 'setup', message: `Add your ${PROV_LABEL[id]} API key in Settings and click Connect.` };
   if (!model) throw { code: 'setup', message: `Open Settings and click Connect so the tool can pick a ${PROV_LABEL[id]} model.` };
   if (id === 'gemini') {
-    const d = await req(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+    const send = think => req(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: SYSTEM }] },
         contents: [{ role: 'user', parts: [...images.map(data => ({ inline_data: { mime_type: 'image/jpeg', data } })), { text: prompt }] }],
-        generationConfig: { temperature: 0.2, responseMimeType: 'application/json' }
+        generationConfig: Object.assign({ temperature: 0.2, responseMimeType: 'application/json' }, think ? { thinkingConfig: think } : {})
       })
-    }, 'Gemini');
+    }, 'Gemini', timeoutS);
+    let d, think = thinkingFor(model);
+    try { d = await send(think); }
+    catch (e) {
+      // Some models reject thinking settings: remember that and retry once without them.
+      if (think && e?.code === 'provider' && e.status === 400 && /thinking/i.test(e.message || '')) { noThinkCfg.add(model); d = await send(null); }
+      else throw e;
+    }
     if (d?.promptFeedback?.blockReason) throw { code: 'provider', message: `Gemini blocked the request (${d.promptFeedback.blockReason}).` };
     const text = (d?.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('');
     if (!text) throw { code: 'provider', message: `Gemini returned no text (finish reason: ${d?.candidates?.[0]?.finishReason || 'unknown'}).`, detail: JSON.stringify(d).slice(0, 600) };
@@ -532,7 +550,7 @@ async function callModel(prompt, images, override) {
   const d = await req('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}`, 'X-Title': 'Creative Pre-Flight' },
     body: JSON.stringify({ model, temperature: 0.2, messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content }] })
-  }, 'OpenRouter');
+  }, 'OpenRouter', timeoutS);
   if (d?.error) throw { code: 'provider', message: d.error.message || 'OpenRouter error', detail: JSON.stringify(d.error).slice(0, 600) };
   const m = d?.choices?.[0]?.message?.content;
   const text = Array.isArray(m) ? m.map(x => x.text || '').join('') : String(m || '');
@@ -559,9 +577,10 @@ function aiError(e) {
     rate_limited: 'The provider is rate-limiting this key. Wait a minute, then try again.',
     model: 'That model isn’t available to your key. Open Settings, click Connect, and pick another model.',
     bad_output: e?.message,
-    network: e?.message
+    network: e?.message,
+    timeout: `${e?.message} The model may be busy or slow. Pick a lighter model in Settings (one with “lite” or “flash” in its name) and try again.`
   };
-  return (map[e?.code] || 'The request failed.') + (e?.code && !['setup', 'network', 'bad_output'].includes(e.code) && e.message ? ` (${PROV_LABEL[aiCfg().provider] || 'Provider'} said: ${String(e.message).slice(0, 220)})` : '');
+  return (map[e?.code] || 'The request failed.') + (e?.code && !['setup', 'network', 'bad_output', 'timeout'].includes(e.code) && e.message ? ` (${PROV_LABEL[aiCfg().provider] || 'Provider'} said: ${String(e.message).slice(0, 220)})` : '');
 }
 function showConnError(e) {
   $('#connOut').innerHTML = `<div class="errbox"><b>${esc(aiError(e))}</b>${e?.detail ? `<code>${esc(e.detail)}</code>` : ''}</div>`;
@@ -589,10 +608,11 @@ function fillModels(models, selected) {
   sel.disabled = !models.length;
 }
 async function testModel() {
-  const out = $('#connOut');
-  out.innerHTML = `<p class="busy">Sending a test request…</p>`;
+  const out = $('#connOut'), c = aiCfg(), t0 = Date.now();
+  const tick = () => { out.innerHTML = `<p class="busy">Waiting for ${esc(PROV_LABEL[c.provider])} (${esc(c.models[c.provider] || '')})… ${Math.round((Date.now() - t0) / 1000)} s</p>`; };
+  tick(); const iv = setInterval(tick, 1000);
   try {
-    const r = await callModel('Reply with exactly this JSON: {"ok":true}', []);
+    const r = await callModel('Reply with exactly this JSON: {"ok":true}', [], null, 90).finally(() => clearInterval(iv));
     parseJSON(r.text);
     out.innerHTML = `<p class="okline">Connected: ${esc(r.label)}. You’re ready to run checks.</p>`;
     setSave(`Saved in this browser · ${r.label}`);
